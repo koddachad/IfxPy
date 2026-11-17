@@ -1251,6 +1251,7 @@ class Cursor(object):
         self._all_stmt_handlers = []
         self.__rowcount = -1
         self._prepare_helper(operation)
+        autocommit = 0
         try:
             autocommit = IfxPy.autocommit(self.conn_handler)
             if autocommit !=  0:
@@ -1267,7 +1268,17 @@ class Cursor(object):
                     self.messages.append(Error(str(IfxPy.stmt_errormsg())))
                     raise self.messages[len(self.messages) - 1]
         except Exception as inst:
-            self._set_rowcount()
+            # We turned autocommit off for this batch, so undo the rows
+            # inserted before the failure and restore the caller's setting
+            if autocommit != 0:
+                try:
+                    IfxPy.rollback(self.conn_handler)
+                    IfxPy.autocommit(self.conn_handler, autocommit)
+                except Exception:
+                    pass
+            # No meaningful count after a failed batch, and asking the driver
+            # for one here raises and hides the real error
+            self.__rowcount = -1
             self.messages.append(Error(inst))
             raise self.messages[len(self.messages) - 1]
         return True

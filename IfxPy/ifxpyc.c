@@ -279,6 +279,7 @@ static void _python_IfxPy_free_result_struct(stmt_handle* handle)
                 case SQL_WCHAR:
                 case SQL_WVARCHAR:
                 case SQL_BIGINT:
+                case SQL_INFX_BIGINT:
                 case SQL_DECIMAL:
                 case SQL_NUMERIC:
 		case SQL_INFX_RC_SET:
@@ -1672,6 +1673,7 @@ static int _python_IfxPy_bind_column_helper(stmt_handle *stmt_res)
             break;
 
         case SQL_BIGINT:
+        case SQL_INFX_BIGINT:
             in_length = stmt_res->column_info [i].size + 2;
             row_data->str_val = (SQLCHAR *)ALLOC_N(char, in_length);
             if (row_data->str_val == NULL)
@@ -2257,6 +2259,9 @@ static SQLWCHAR* getUnicodeDataAsSQLWCHAR(PyObject *pyobj, int *isNewBuffer)
 
 
 // This function takes value as pyObject and convert it to SQLWCHAR and return it
+// Disabled: never called, and PyUnicode_AS_UNICODE was removed in Python 3.12,
+// so builds that keep the function fail to import with an undefined symbol
+#if 0
 static SQLWCHAR* xgetUnicodeDataAsSQLWCHAR(PyObject *pyobj, int *isNewBuffer)
 {
     PyObject *sysmodule = NULL, *maxuni = NULL;
@@ -2298,6 +2303,7 @@ static SQLWCHAR* xgetUnicodeDataAsSQLWCHAR(PyObject *pyobj, int *isNewBuffer)
     return pNewBuffer;
 
 }
+#endif
 
 
 
@@ -3066,6 +3072,12 @@ static PyObject *IfxPy_close(PyObject *self, PyObject *args)
             {
                 return NULL;
             }
+
+            // Disconnected: the handles are freed below, so mark the
+            // connection inactive now. The error returns that follow must
+            // not leave a freed hdbc marked active (use-after-free in
+            // active(), double free in the destructor).
+            conn_res->handle_active = 0;
 
             tempNode = rootNode;
 			while (tempNode)
@@ -5980,7 +5992,7 @@ static int _python_IfxPy_bind_data(stmt_handle *stmt_res, param_node *curr, PyOb
     switch (TYPE(bind_data))
     {
     case PYTHON_FIXNUM:
-        if (curr->data_type == SQL_BIGINT || curr->data_type == SQL_DECIMAL )
+        if (curr->data_type == SQL_BIGINT || curr->data_type == SQL_INFX_BIGINT || curr->data_type == SQL_DECIMAL )
         {
             PyObject *tempobj = NULL;
 #if  PY_MAJOR_VERSION >= 3
@@ -5991,7 +6003,13 @@ static int _python_IfxPy_bind_data(stmt_handle *stmt_res, param_node *curr, PyOb
             tempobj2 = PyUnicode_AsASCIIString(tempobj);
             Py_XDECREF(tempobj);
             tempobj = tempobj2;
-#endif    
+#endif
+            // Free the previous row's copy; execute_many rebinds the same node per row
+            if (curr->svalue != NULL)
+            {
+                PyMem_Del(curr->svalue);
+                curr->svalue = NULL;
+            }
             curr->svalue = PyBytes_AsString(tempobj);
             curr->ivalue = strlen(curr->svalue);
             curr->svalue = memcpy(PyMem_Malloc((sizeof(char))*(curr->ivalue + 1)), curr->svalue, curr->ivalue);
@@ -8227,6 +8245,7 @@ static PyObject *IfxPy_field_type(PyObject *self, PyObject *args)
         str_val = "int";
         break;
     case SQL_BIGINT:
+    case SQL_INFX_BIGINT:
         str_val = "bigint";
         break;
     case SQL_REAL:
@@ -8688,6 +8707,7 @@ static PyObject *IfxPy_result(PyObject *self, PyObject *args)
         case SQL_WVARCHAR:
         case SQL_LONGVARCHAR:
         case SQL_BIGINT:
+        case SQL_INFX_BIGINT:
         case SQL_DECIMAL:
         case SQL_NUMERIC:
         case SQL_INFX_RC_SET:
@@ -9310,6 +9330,7 @@ static PyObject *_python_IfxPy_bind_fetch_helper(PyObject *args, int op)
                 break;
 
             case SQL_BIGINT:
+            case SQL_INFX_BIGINT:
                 value = PyLong_FromString((char *)row_data->str_val, NULL, 10);
                 break;
 
@@ -11147,6 +11168,11 @@ static PyObject *IfxPy_active(PyObject *self, PyObject *args)
         {
             conn_res = (conn_handle *)py_conn_res;
         }
+        // After IfxPy.close() the hdbc has been freed; don't touch it.
+        if (!conn_res->handle_active)
+        {
+            Py_RETURN_FALSE;
+        }
         rc = SQLGetConnectAttr(conn_res->hdbc, SQL_ATTR_CONNECTION_DEAD,
             (SQLPOINTER)&conn_dead, 0, NULL);
         if (rc == SQL_ERROR)
@@ -11379,7 +11405,7 @@ static PyObject* IfxPy_execute_many(PyObject *self, PyObject *args)
     int chaining_start = 0;
 
     SQLSMALLINT *data_type;
-    SQLUINTEGER precision;
+    SQLULEN precision;  // SQLDescribeParam writes a SQLULEN; a 4-byte type corrupts the stack
     SQLSMALLINT scale;
     SQLSMALLINT nullable;
     SQLSMALLINT *ref_data_type;
@@ -11441,6 +11467,8 @@ static PyObject* IfxPy_execute_many(PyObject *self, PyObject *args)
                 if (rc == SQL_ERROR)
                 {
                     PyErr_SetString(PyExc_Exception, IFX_G(__python_stmt_err_msg));
+                    PyMem_Del(data_type);
+                    PyMem_Del(ref_data_type);
                     return NULL;
                 }
                 build_list(stmt_res, i + 1, data_type [i], precision,
@@ -11455,7 +11483,8 @@ static PyObject* IfxPy_execute_many(PyObject *self, PyObject *args)
         head_error_list->next = NULL;
         if (numOfRows > 0)
         {
-            for (i = 0; i < numOfRows; i++)
+            // Stop at the first rejected row; the caller gets an error naming it
+            for (i = 0; i < numOfRows && err_count == 0; i++)
             {
                 int j = 0;
                 param_node *curr = NULL;
@@ -11562,7 +11591,7 @@ static PyObject* IfxPy_execute_many(PyObject *self, PyObject *args)
                         switch (ref_data_type [curr->param_num - 1])
                         {
                         case PYTHON_FIXNUM:
-                            if (curr->data_type == SQL_BIGINT || curr->data_type == SQL_DECIMAL)
+                            if (curr->data_type == SQL_BIGINT || curr->data_type == SQL_INFX_BIGINT || curr->data_type == SQL_DECIMAL)
                             {
                                 valueType = SQL_C_CHAR;
                             }
@@ -11704,31 +11733,57 @@ static PyObject* IfxPy_execute_many(PyObject *self, PyObject *args)
                             rc = SQLParamData((SQLHSTMT)stmt_res->hstmt, (SQLPOINTER *)&valuePtr);
                         }
                     }
+
+                    // A row the server rejects must not be skipped silently
+                    if (rc == SQL_ERROR && error [0] == '\0')
+                    {
+                        _python_IfxPy_check_sql_errors(stmt_res->hstmt, SQL_HANDLE_STMT, rc, 1, NULL, -1, 1);
+                        snprintf(error, sizeof(error), "Row %d rejected: %s", i + 1, IFX_G(__python_stmt_err_msg));
+                        _build_client_err_list(head_error_list, error);
+                        err_count++;
+                    }
+                    else if (error [0] == '\0')
+                    {
+                        SQLLEN rows_affected = 0;
+                        Py_BEGIN_ALLOW_THREADS;
+                        rc = SQLRowCount((SQLHSTMT)stmt_res->hstmt, &rows_affected);
+                        Py_END_ALLOW_THREADS;
+                        if (rc != SQL_ERROR && rows_affected > 0)
+                        {
+                            row_cnt += rows_affected;
+                        }
+                    }
                 }
             }
         }
         else
         {
+            PyMem_Del(head_error_list);
+            PyMem_Del(data_type);
+            PyMem_Del(ref_data_type);
             return PyInt_FromLong(0);
 
         }
 
-        // Set statement attribute SQL_ATTR_CHAINING_END 
-        //rc = _IfxPy_chaining_flag(stmt_res, SQL_ATTR_CHAINING_END, head_error_list->next, err_count);
-        //if (head_error_list != NULL)
-        //{
-        //    error_msg_node *tmp_err = NULL;
-        //    while (head_error_list != NULL)
-        //    {
-        //        tmp_err = head_error_list;
-        //        head_error_list = head_error_list->next;
-        //        PyMem_Del(tmp_err);
-        //    }
-        //}
-        //if (rc != SQL_SUCCESS || err_count != 0)
-        //{
-        //    return NULL;
-        //}
+        // Free the collected errors, raising the first one if any row failed
+        error [0] = '\0';
+        if (err_count != 0 && head_error_list->next != NULL)
+        {
+            snprintf(error, sizeof(error), "%s", head_error_list->next->err_msg);
+        }
+        while (head_error_list != NULL)
+        {
+            error_msg_node *tmp_err = head_error_list;
+            head_error_list = head_error_list->next;
+            PyMem_Del(tmp_err);
+        }
+        PyMem_Del(data_type);
+        PyMem_Del(ref_data_type);
+        if (err_count != 0)
+        {
+            PyErr_SetString(PyExc_Exception, error);
+            return NULL;
+        }
     }
     else
     {
@@ -11737,17 +11792,6 @@ static PyObject* IfxPy_execute_many(PyObject *self, PyObject *args)
 
     }
 
-    Py_BEGIN_ALLOW_THREADS;
-    rc = SQLRowCount((SQLHSTMT)stmt_res->hstmt, &row_cnt);
-    Py_END_ALLOW_THREADS;
-
-    if ((rc == SQL_ERROR) && (stmt_res != NULL))
-    {
-        _python_IfxPy_check_sql_errors(stmt_res->hstmt, SQL_HANDLE_STMT, rc, 1, NULL, -1, 1);
-        sprintf(error, "SQLRowCount failed: %s", IFX_G(__python_stmt_err_msg));
-        PyErr_SetString(PyExc_Exception, error);
-        return NULL;
-    }
     return PyInt_FromLong(row_cnt);
 }
 
@@ -11973,6 +12017,7 @@ static PyObject* IfxPy_callproc(PyObject *self, PyObject *args)
                             paramCount++;
                             break;
                         case SQL_BIGINT:
+                        case SQL_INFX_BIGINT:
                             if (!NIL_P(tmp_curr->svalue))
                             {
                                 PyTuple_SetItem(outTuple, paramCount,
